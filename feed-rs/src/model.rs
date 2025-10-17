@@ -410,7 +410,7 @@ impl Entry {
         self
     }
 
-    pub fn custom(mut self, key: &str, value: &str) -> Self {
+    pub fn attributes(mut self, key: &str, value: &str) -> Self {
         self.attributes.insert(key.parse().unwrap(), value.to_owned());
         self
     }
