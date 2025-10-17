@@ -306,8 +306,8 @@ pub struct Entry {
     /// references found within the scope on the item
     pub base: Option<String>,
 
-    /// Custom attributes stored in HashMap
-    pub attributes: HashMap<String, String>,
+    /// Additional uncategorized attributes stored in HashMap
+    pub custom_attributes: HashMap<String, String>,
 }
 
 impl Default for Entry {
@@ -328,7 +328,7 @@ impl Default for Entry {
             media: Vec::new(),
             language: None,
             base: None,
-            attributes: HashMap::new(),
+            custom_attributes: HashMap::new(),
         }
     }
 }
@@ -410,8 +410,8 @@ impl Entry {
         self
     }
 
-    pub fn attributes(mut self, key: &str, value: &str) -> Self {
-        self.attributes.insert(key.parse().unwrap(), value.to_owned());
+    pub fn custom_attribute(mut self, key: &str, value: &str) -> Self {
+        self.custom_attributes.insert(key.parse().unwrap(), value.to_owned());
         self
     }
 }

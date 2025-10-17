@@ -251,8 +251,8 @@ fn handle_item<R: BufRead>(parser: &Parser, element: Element<R>) -> ParseFeedRes
             // MediaRSS tags that are not grouped are parsed into the default object
             (NS::MediaRSS, _) => handle_media_element(child, &mut media_obj)?,
 
-            (NS::Unknown, key) => if_some_then(child.child_as_text(), |item| {
-                entry.attributes.insert(key.to_string(), item);
+            (NS::Unknown, key) => if_some_then(child.child_as_text(), |value| {
+                entry.custom_attributes.insert(key.to_string(), value);
             }),
 
             // Nothing required for unknown elements
