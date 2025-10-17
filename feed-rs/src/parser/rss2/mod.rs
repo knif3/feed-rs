@@ -252,7 +252,7 @@ fn handle_item<R: BufRead>(parser: &Parser, element: Element<R>) -> ParseFeedRes
             (NS::MediaRSS, _) => handle_media_element(child, &mut media_obj)?,
 
             (NS::Unknown, key) => if_some_then(child.child_as_text(), |item| {
-                entry.attribute.insert(key.to_string(), item);
+                entry.attributes.insert(key.to_string(), item);
             }),
 
             // Nothing required for unknown elements

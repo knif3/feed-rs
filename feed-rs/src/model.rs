@@ -307,7 +307,7 @@ pub struct Entry {
     pub base: Option<String>,
 
     /// Custom attributes stored in HashMap
-    pub attribute: HashMap<String, String>,
+    pub attributes: HashMap<String, String>,
 }
 
 impl Default for Entry {
@@ -328,7 +328,7 @@ impl Default for Entry {
             media: Vec::new(),
             language: None,
             base: None,
-            attribute: HashMap::new(),
+            attributes: HashMap::new(),
         }
     }
 }
@@ -411,7 +411,7 @@ impl Entry {
     }
 
     pub fn custom(mut self, key: &str, value: &str) -> Self {
-        self.attribute.insert(key.parse().unwrap(), value.to_owned());
+        self.attributes.insert(key.parse().unwrap(), value.to_owned());
         self
     }
 }
