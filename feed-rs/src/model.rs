@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -304,6 +305,9 @@ pub struct Entry {
     /// Atom (optional): The base url specified on the item to resolve any relative
     /// references found within the scope on the item
     pub base: Option<String>,
+
+    /// Custom attributes stored in HashMap
+    pub attribute: HashMap<String, String>,
 }
 
 impl Default for Entry {
@@ -324,6 +328,7 @@ impl Default for Entry {
             media: Vec::new(),
             language: None,
             base: None,
+            attribute: HashMap::new(),
         }
     }
 }
@@ -402,6 +407,11 @@ impl Entry {
 
     pub fn base(mut self, url: &str) -> Self {
         self.base = Some(url.to_owned());
+        self
+    }
+
+    pub fn custom(mut self, key: &str, value: &str) -> Self {
+        self.attribute.insert(key.parse().unwrap(), value.to_owned());
         self
     }
 }
