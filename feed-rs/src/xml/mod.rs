@@ -5,13 +5,11 @@ use std::fmt::Debug;
 use std::io::BufRead;
 use std::mem;
 
-use quick_xml::events::{BytesCData, BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::encoding::DecodingReader;
+use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::{NsReader, Reader};
 use url::Url;
-
-#[cfg(test)]
-mod tests;
 
 /// Iteration over the XML elements may return an error (malformed content etc)
 pub(crate) type XmlResult<T> = Result<T, XmlError>;
@@ -31,7 +29,7 @@ impl<R: BufRead> ElementSource<R> {
     /// * `xml_base_uri` - the base URI if known (e.g. Content-Location, feed URI etc)
     pub(crate) fn new(xml_data: R, xml_base_uri: Option<&str>) -> XmlResult<ElementSource<R>> {
         // Create the XML parser
-        let mut reader = NsReader::from_reader(xml_data);
+        let mut reader = NsReader::from_reader(DecodingReader::new(xml_data));
         let config = reader.config_mut();
         config.expand_empty_elements = true;
         config.trim_markup_names_in_closing_tags = true;
@@ -50,7 +48,7 @@ impl<R: BufRead> ElementSource<R> {
     }
 
     /// Returns the first element in the source
-    pub(crate) fn root(&self) -> XmlResult<Option<Element<R>>> {
+    pub(crate) fn root(&self) -> XmlResult<Option<Element<'_, R>>> {
         self.next_element_at_depth(1)
     }
 
@@ -106,14 +104,113 @@ impl<R: BufRead> ElementSource<R> {
         Ok(())
     }
 
+    // Return the raw XML of all children at or below the nominated depth
+    fn children_as_xhtml(&self, depth: u32, buffer: &mut String) -> XmlResult<()> {
+        // Read nodes at the current depth or greater
+        let mut state = self.state.borrow_mut();
+        let mut current_depth = depth;
+
+        let buffer_start = buffer.len();
+
+        // Every valid XHTML node contains only a div. But in practice there are lots of invalid feeds and we don't want to assume that. So we first serialize with the div, but then if the feed is valid we strip it after the fact. If the feed isn't just a `div` child then we leave it as-is.
+        let mut first_element = true;
+        let mut div_open = None;
+        let mut div_close = None;
+
+        loop {
+            // A strange construction, but we need to throw an error if we cannot consume all the children (e.g. malformed XML)
+            let peeked = state.peek();
+            if peeked.is_err() {
+                return Err(state.next().err().unwrap());
+            }
+
+            // Fetch the next event
+            if let Some(event) = peeked.as_ref().unwrap() {
+                match event {
+                    XmlEvent::Start { name, attributes, .. } => {
+                        if current_depth == depth {
+                            if first_element {
+                                if name != "div" {
+                                    // Note: We should also check for xhtml namespace but in practice it is better to just assume that instead of rejecting.
+                                    first_element = false;
+                                }
+                            } else {
+                                div_open = None;
+                                div_close = None;
+                            }
+                        }
+
+                        // Note that we have descended into an element
+                        current_depth += 1;
+
+                        // Append element start to the buffer
+                        append_element_start(buffer, name, attributes);
+
+                        if first_element {
+                            first_element = false;
+                            div_open = Some(buffer.len());
+                        }
+                    }
+
+                    XmlEvent::Text(text) => {
+                        if current_depth == depth && text.as_bytes().iter().any(|c| !c.is_ascii_whitespace()) {
+                            // Text content outside of the root div.
+                            first_element = false;
+                            div_open = None;
+                            div_close = None;
+                        }
+
+                        // Append text to the buffer
+                        append_element_text(buffer, text);
+                    }
+
+                    XmlEvent::End { name, .. } => {
+                        // Break out of the iteration if we would move above our iteration depth
+                        current_depth -= 1;
+                        if current_depth < depth {
+                            break;
+                        }
+
+                        let close_start = buffer.len();
+
+                        // Append this terminating element
+                        append_element_end(buffer, name);
+
+                        if current_depth == depth && div_open.is_some() {
+                            div_close = Some(close_start);
+                        }
+                    }
+                }
+
+                // Consume this node
+                state.next()?;
+            } else {
+                // In the case where we have no more nodes, we hit the end of the document so we can just break out of this loop
+                break;
+            }
+        }
+
+        if let Some((div_open, div_close)) = div_open.zip(div_close) {
+            buffer.truncate(div_close);
+            buffer.drain(buffer_start..div_open);
+        }
+
+        Ok(())
+    }
+
     // Returns the next element at the nominated depth
-    fn next_element_at_depth(&self, iter_depth: u32) -> XmlResult<Option<Element<R>>> {
+    fn next_element_at_depth(&self, iter_depth: u32) -> XmlResult<Option<Element<'_, R>>> {
         // Read nodes until we arrive at the correct depth
         let mut state = self.state.borrow_mut();
         while let Some(node) = state.next()? {
             match node {
                 // The start of an element may be interesting to the iterator
-                XmlEvent::Start { name, attributes, namespace } => {
+                XmlEvent::Start {
+                    buffer_pos,
+                    name,
+                    attributes,
+                    namespace,
+                } => {
                     // Starting an element increases our depth
                     state.current_depth += 1;
 
@@ -123,12 +220,13 @@ impl<R: BufRead> ElementSource<R> {
                     // If we are at the correct depth we found a node of interest
                     if state.current_depth == iter_depth {
                         let element = Element {
-                            namespace,
+                            namespace: namespace.unwrap_or(state.default_namespace),
                             name,
                             attributes,
                             xml_base: ElementSource::xml_base_fetch(&state),
                             source: self,
                             depth: state.current_depth,
+                            buffer_pos,
                         };
                         return Ok(Some(element));
                     }
@@ -166,16 +264,21 @@ impl<R: BufRead> ElementSource<R> {
     fn text_node(&self) -> Option<String> {
         let mut state = self.state.borrow_mut();
 
+        let mut buffer = None;
+
         // If the next event is characters, we have found our text
-        if let Ok(Some(XmlEvent::Text(_text))) = state.peek() {
-            // Grab the next event - we know its a Text event from the above
+        while let Ok(Some(XmlEvent::Text(_text))) = state.peek() {
+            // Grab the next event - we know it's a Text event from the above
             match state.next() {
-                Ok(Some(XmlEvent::Text(text))) => return Some(text),
+                Ok(Some(XmlEvent::Text(text))) => match buffer {
+                    Some(ref mut b) => *b += text.as_str(),
+                    None => buffer = Some(text),
+                },
                 _ => unreachable!("state.next() did not return expected XmlEvent::Text"),
             }
         }
 
-        None
+        buffer
     }
 
     // Fetches the currently active xml-base
@@ -227,9 +330,11 @@ impl<R: BufRead> ElementSource<R> {
 
 // Wraps the XML source and current depth of iteration
 struct SourceState<R: BufRead> {
-    reader: NsReader<R>,
+    reader: NsReader<DecodingReader<R>>,
     buf_event: Vec<u8>,
     next: XmlResult<Option<XmlEvent>>,
+    // An event stashed while coalescing text (e.g. the start tag terminating a run of text and entity references)
+    pending_text: Option<XmlEvent>,
     current_depth: u32,
     base_uris: Vec<(u32, Url)>,
     default_namespace: NS,
@@ -237,7 +342,7 @@ struct SourceState<R: BufRead> {
 
 impl<R: BufRead> SourceState<R> {
     // Wrap the reader in additional state (buffers, tree depth etc)
-    fn new(reader: NsReader<R>, xml_base_uri: Option<&str>) -> XmlResult<SourceState<R>> {
+    fn new(reader: NsReader<DecodingReader<R>>, xml_base_uri: Option<&str>) -> XmlResult<SourceState<R>> {
         // If we have a base URI, parse it and init at the root
         let mut base_uris = Vec::new();
         if let Some(xml_base_uri) = xml_base_uri {
@@ -250,6 +355,7 @@ impl<R: BufRead> SourceState<R> {
             reader,
             buf_event,
             next: Ok(None),
+            pending_text: None,
             current_depth: 0,
             base_uris,
             default_namespace: NS::Unknown,
@@ -260,52 +366,96 @@ impl<R: BufRead> SourceState<R> {
 
     // Returns the next event
     fn fetch_next(&mut self) -> XmlResult<Option<XmlEvent>> {
-        let decoder = self.reader.decoder();
+        // Emit an event stashed while coalescing text
+        if let Some(event) = self.pending_text.take() {
+            return Ok(Some(event));
+        }
+
         let reader = &mut self.reader;
+
+        // Text, CData and entity references are coalesced into a single text event
+        let mut text: Option<String> = None;
 
         loop {
             let (ns_resolution, event) = reader.read_resolved_event_into(&mut self.buf_event)?;
 
             match event {
+                // XML declaration for the encoding
+                Event::Decl(ref decl) => {
+                    if let Some(encoding) = decl.encoder() {
+                        reader.get_mut().set_encoding(encoding);
+                    }
+                }
+
                 // Start of an element
                 Event::Start(ref e) => {
                     // Parse the namespace
+                    // The default namespace is applied when the event is consumed, since it may not be known yet
+                    // (e.g. the root element is examined to determine the feed type, which in turn sets the default namespace)
                     let namespace = match ns_resolution {
-                        ResolveResult::Bound(ns) => decoder
-                            .decode(ns.as_ref())
-                            .map(|decoded| NS::parse(decoded.as_ref()))
-                            .unwrap_or(self.default_namespace),
-                        ResolveResult::Unknown(_) => self.default_namespace,
-                        ResolveResult::Unbound => self.default_namespace,
+                        ResolveResult::Bound(ns) => Some(NS::parse(ns.as_ref())),
+                        ResolveResult::Unknown(_) => None,
+                        ResolveResult::Unbound => None,
                     };
 
-                    return Ok(Some(XmlEvent::start(namespace, e, reader)));
+                    let start = XmlEvent::start(namespace, e, reader);
+                    return match text.take() {
+                        Some(text) => {
+                            self.pending_text = Some(start);
+                            Ok(Some(XmlEvent::Text(text)))
+                        }
+                        None => Ok(Some(start)),
+                    };
                 }
 
                 // End of an element
                 Event::End(ref e) => {
-                    return Ok(Some(XmlEvent::end(e, reader)));
+                    let end = XmlEvent::end(e);
+                    return match text.take() {
+                        Some(text) => {
+                            self.pending_text = Some(end);
+                            Ok(Some(XmlEvent::Text(text)))
+                        }
+                        None => Ok(Some(end)),
+                    };
                 }
 
                 // Text
                 Event::Text(ref t) => {
-                    let event = XmlEvent::text(t, reader);
-                    if let Ok(Some(ref _t)) = event {
-                        return event;
+                    if !t.is_empty() {
+                        text.get_or_insert_with(String::new).push_str(t);
                     }
                 }
 
                 // CData is converted to text
-                Event::CData(t) => {
-                    let event = XmlEvent::text_from_cdata(&t, reader);
-                    if let Ok(Some(ref _t)) = event {
-                        return event;
+                Event::CData(ref t) => {
+                    if !t.is_empty() {
+                        text.get_or_insert_with(String::new).push_str(t);
+                    }
+                }
+
+                // Character and entity references (e.g. "&#38;" or "&amp;") are resolved into text
+                Event::GeneralRef(ref r) => {
+                    let buffer = text.get_or_insert_with(String::new);
+                    if let Some(ch) = r.resolve_char_ref()? {
+                        buffer.push(ch);
+                    } else {
+                        let name = r.as_ref();
+                        match quick_xml::escape::resolve_predefined_entity(name) {
+                            Some(resolved) => buffer.push_str(resolved),
+                            // Unknown entities cannot be resolved, so retain them in their escaped form
+                            None => {
+                                buffer.push('&');
+                                buffer.push_str(name);
+                                buffer.push(';');
+                            }
+                        }
                     }
                 }
 
                 // The end of the document
                 Event::Eof => {
-                    return Ok(None);
+                    return Ok(text.take().map(XmlEvent::Text));
                 }
 
                 // Ignore everything else
@@ -347,10 +497,11 @@ pub(crate) struct Element<'a, R: BufRead> {
 
     // The underlying source of XML events
     source: &'a ElementSource<R>,
+
+    // Byte position in the source at which this element starts
+    pub buffer_pos: u64,
 }
 
-// TODO this is flagged as needless, but is required in Element... fix this
-#[allow(clippy::needless_lifetimes)]
 impl<'a, R: BufRead> Element<'a, R> {
     /// Returns the value for an attribute if it exists
     pub(crate) fn attr_value(&self, name: &str) -> Option<String> {
@@ -362,8 +513,19 @@ impl<'a, R: BufRead> Element<'a, R> {
         self.source.text_node()
     }
 
+    /// Return the text of a node, or if it contains children the serialized content of the node.
+    ///
+    /// This function is a hack to deal with invalid feeds. In all cases we **should** know if we should take the text or serialize the children.
+    pub(crate) fn child_as_text_sloppy(&self) -> XmlResult<Option<String>> {
+        if let Some(s) = self.source.text_node() {
+            return Ok(Some(s));
+        }
+
+        self.children_as_string()
+    }
+
     /// Returns an iterator over children of this element (i.e. descends a level in the hierarchy)
-    pub(crate) fn children(&self) -> ElementIter<R> {
+    pub(crate) fn children(&self) -> ElementIter<'_, R> {
         ElementIter {
             source: self.source,
             depth: self.depth + 1,
@@ -381,14 +543,22 @@ impl<'a, R: BufRead> Element<'a, R> {
         Ok(Some(buffer))
     }
 
+    /// Concatenates the children of this node into a string
+    ///
+    /// NOTE: the input stream is parsed then re-serialised so the output will not be identical to the input
+    pub(crate) fn children_as_xhtml(&self) -> XmlResult<Option<String>> {
+        // Fill the buffer with the XML content below this element
+        let mut buffer = String::new();
+        self.source.children_as_xhtml(self.depth + 1, &mut buffer)?;
+        Ok(Some(buffer))
+    }
+
     /// Returns the namespace + tag name for this element
     pub(crate) fn ns_and_tag(&self) -> (NS, &str) {
         (self.namespace, &self.name)
     }
 }
 
-// TODO this is flagged as needless, but is required in Element... fix this
-#[allow(clippy::needless_lifetimes)]
 impl<'a, R: BufRead> Debug for Element<'a, R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut buffer = String::new();
@@ -423,9 +593,12 @@ pub(crate) enum NS {
     DublinCore,
     MediaRSS,
     Itunes,
+    Podcast,
+    WellFormedWebComments,
 }
 
 impl NS {
+    //noinspection HttpUrlsUsage
     fn parse(s: &str) -> NS {
         match s {
             "http://purl.org/rss/1.0/" => NS::RSS,
@@ -436,6 +609,8 @@ impl NS {
             "http://purl.org/dc/elements/1.1/" => NS::DublinCore,
             "http://search.yahoo.com/mrss/" => NS::MediaRSS,
             "http://www.itunes.com/dtds/podcast-1.0.dtd" => NS::Itunes,
+            "https://podcastindex.org/namespace/1.0" => NS::Podcast,
+            "http://wellformedweb.org/CommentAPI/" => NS::WellFormedWebComments,
 
             // Everything else is ignored
             _ => NS::Unknown,
@@ -498,55 +673,51 @@ impl From<quick_xml::escape::EscapeError> for XmlError {
 // Abstraction over the underlying XML reader event model
 enum XmlEvent {
     // An XML start tag
-    Start { namespace: NS, name: String, attributes: Vec<NameValue> },
+    // The namespace is `None` when the document does not declare one; the source's default namespace is applied on consumption
+    Start {
+        buffer_pos: u64,
+        namespace: Option<NS>,
+        name: String,
+        attributes: Vec<NameValue>,
+    },
     // An XML end tag
-    End { name: String },
+    End {
+        name: String,
+    },
     // Text or CData
     Text(String),
 }
 
 impl XmlEvent {
     // Creates a new event corresponding to an XML end-tag
-    fn end<R: BufRead>(event: &BytesEnd, reader: &Reader<R>) -> XmlEvent {
+    fn end(event: &BytesEnd) -> XmlEvent {
         // Parse the name
-        let name = XmlEvent::parse_name(event.name().as_ref(), reader);
+        let name = XmlEvent::parse_name(event.name().as_ref());
 
         XmlEvent::End { name }
     }
 
     // Extracts the element name, dropping the namespace prefix if present
-    fn parse_name<R: BufRead>(bytes: &[u8], reader: &Reader<R>) -> String {
-        reader
-            .decoder()
-            .decode(bytes)
-            .ok()
-            .and_then(|name| name.split(':').next_back().map(str::to_string))
-            .unwrap_or_default()
+    fn parse_name(name: &str) -> String {
+        name.split(':').next_back().map(|s| s.to_string()).unwrap_or_default()
     }
 
     // Creates a new event corresponding to an XML start-tag
-    fn start<R: BufRead>(namespace: NS, event: &BytesStart, reader: &Reader<R>) -> XmlEvent {
+    fn start<R: BufRead>(namespace: Option<NS>, event: &BytesStart, reader: &Reader<R>) -> XmlEvent {
+        let buffer_pos = reader.buffer_position();
         // Parse the name
-        let name = XmlEvent::parse_name(event.name().as_ref(), reader);
+        let name = XmlEvent::parse_name(event.name().as_ref());
 
         // Parse the attributes
         let attributes = event
             .attributes()
             .filter_map(|a| {
                 if let Ok(a) = a {
-                    let name = match reader.decoder().decode(a.key.as_ref()) {
-                        Ok(decoded) => decoded,
-                        Err(_) => return None,
-                    };
+                    let name = a.key.as_ref();
 
-                    // Unescape the XML attribute, or use the original value if this fails (broken escape sequence etc)
-                    let decoded_value = match reader.decoder().decode(&a.value) {
-                        Ok(decoded) => decoded,
-                        Err(_) => return None,
-                    };
-                    let value = quick_xml::escape::unescape(&decoded_value)
-                        .unwrap_or_else(|_| decoded_value.clone())
-                        .to_string();
+                    // Unescape the XML attribute or use the original value if this fails (broken escape sequence etc)
+                    let decoded_value = &a.value;
+                    let value = quick_xml::escape::unescape(decoded_value).unwrap_or_else(|_| decoded_value.clone()).to_string();
 
                     Some(NameValue { name: name.into(), value })
                 } else {
@@ -555,30 +726,11 @@ impl XmlEvent {
             })
             .collect::<Vec<NameValue>>();
 
-        XmlEvent::Start { namespace, name, attributes }
-    }
-
-    // Creates a new event corresponding to an XML text node
-    fn text<R: BufRead>(text: &BytesText, reader: &Reader<R>) -> XmlResult<Option<XmlEvent>> {
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            let escaped_text = reader.decoder().decode(text)?;
-            let unescaped_text = quick_xml::escape::unescape(&escaped_text)?;
-
-            Ok(Some(XmlEvent::Text(unescaped_text.to_string())))
-        }
-    }
-
-    // Creates a new event from the corresponding cdata
-    // No need to unescape in this case given cdata is "raw"
-    fn text_from_cdata<R: BufRead>(cdata: &BytesCData, reader: &Reader<R>) -> XmlResult<Option<XmlEvent>> {
-        if cdata.is_empty() {
-            Ok(None)
-        } else {
-            let decoded_text = reader.decoder().decode(cdata)?;
-
-            Ok(Some(XmlEvent::Text(decoded_text.to_string())))
+        XmlEvent::Start {
+            buffer_pos,
+            namespace,
+            name,
+            attributes,
         }
     }
 }
@@ -607,5 +759,8 @@ fn append_element_start(buffer: &mut String, name: &str, attributes: &[NameValue
 
 // Appends a text element
 fn append_element_text(buffer: &mut String, text: &str) {
-    buffer.push_str(text);
+    buffer.push_str(&quick_xml::escape::minimal_escape(text));
 }
+
+#[cfg(test)]
+mod tests;
